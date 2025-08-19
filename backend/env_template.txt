@@ -1,0 +1,15 @@
+# Twilio Configuration
+# You'll need these from your Twilio Console
+TWILIO_ACCOUNT_SID=your_account_sid_here
+TWILIO_API_KEY_SID=your_api_key_sid_here
+TWILIO_API_KEY_SECRET=your_api_key_secret_here
+
+# Twilio Phone Numbers
+TWILIO_NUMBER_A=+1234567890
+TWILIO_NUMBER_B=+1234567890
+
+# Application Configuration
+FRONTEND_URL=http://localhost:5173
+BACKEND_URL=http://127.0.0.1:5000
+CORS_ORIGIN=http://localhost:5173
+FLASK_SECRET=your-secret-key-here
