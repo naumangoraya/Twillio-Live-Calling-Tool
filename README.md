@@ -23,7 +23,8 @@ Useful links:
 ## 1) Clone and install
 ```bash
 # open a terminal
-cd C:\Users\<you>\Desktop\Alexproject\twillioCall\twillioCall
+git clone https://github.com/naumangoraya/Twillio-Live-Calling-Tool.git
+cd Twillio-Live-Calling-Tool
 
 # Backend deps (inside conda later, see step 2)
 cd backend
