@@ -1,6 +1,7 @@
 import json
 import os
 import queue
+import logging
 from urllib.parse import urlencode
 
 from dotenv import load_dotenv
@@ -8,7 +9,11 @@ from flask import Flask, jsonify, request, Response
 from flask_cors import CORS
 from twilio.rest import Client
 from twilio.twiml.voice_response import VoiceResponse, Dial, Say
+from twilio.base.exceptions import TwilioException, TwilioRestException
 
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Load environment variables from project root .env if present
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "..", ".env"))
@@ -33,11 +38,79 @@ app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET", "dev-secret-change-me")
 CORS(app, resources={r"/api/*": {"origins": CORS_ORIGIN}})
 
 
-# Twilio REST client
-twilio_client = None
-if TWILIO_ACCOUNT_SID and TWILIO_API_KEY_SID and TWILIO_API_KEY_SECRET:
-    twilio_client = Client(TWILIO_API_KEY_SID, TWILIO_API_KEY_SECRET, TWILIO_ACCOUNT_SID)
+class TwilioClientManager:
+    """Manages Twilio client with fallback authentication methods"""
+    
+    def __init__(self):
+        self.primary_client = None
+        self.fallback_client = None
+        self.current_method = None
+        self._initialize_clients()
+    
+    def _initialize_clients(self):
+        """Initialize both authentication methods"""
+        # Try Auth Token first (has full permissions, more reliable)
+        if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
+            try:
+                self.primary_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+                self.current_method = "auth_token"
+                logger.info("Primary Twilio client initialized with Auth Token authentication")
+            except Exception as e:
+                logger.warning(f"Failed to initialize Auth Token client: {e}")
+                self.primary_client = None
+        
+        # Try API Key as fallback (more secure but may have permission restrictions)
+        if TWILIO_ACCOUNT_SID and TWILIO_API_KEY_SID and TWILIO_API_KEY_SECRET:
+            try:
+                self.fallback_client = Client(TWILIO_API_KEY_SID, TWILIO_API_KEY_SECRET, TWILIO_ACCOUNT_SID)
+                if not self.primary_client:
+                    self.current_method = "api_key"
+                    logger.info("Fallback Twilio client initialized with API Key authentication")
+                else:
+                    logger.info("Fallback Twilio client initialized with API Key (backup)")
+            except Exception as e:
+                logger.warning(f"Failed to initialize API Key client: {e}")
+                self.fallback_client = None
+    
+    def get_client(self):
+        """Get the current working client"""
+        return self.primary_client or self.fallback_client
+    
+    def get_auth_method(self):
+        """Get current authentication method"""
+        if self.primary_client:
+            return "auth_token"
+        elif self.fallback_client:
+            return "api_key"
+        return "none"
+    
+    def test_connection(self):
+        """Test the current client connection"""
+        client = self.get_client()
+        if not client:
+            return False, "No Twilio client available"
+        
+        try:
+            # Try to fetch account info to test connection
+            account = client.api.accounts(TWILIO_ACCOUNT_SID).fetch()
+            return True, f"Connected using {self.get_auth_method()} authentication"
+        except TwilioRestException as e:
+            if e.code == 20003:  # Authentication error
+                # Try to switch to fallback if available
+                if self.primary_client and self.fallback_client and self.current_method == "auth_token":
+                    logger.warning("Auth Token authentication failed, switching to API Key")
+                    self.current_method = "api_key"
+                    return self.test_connection()
+                else:
+                    return False, f"Authentication failed: {e.msg}"
+            else:
+                return False, f"Twilio error: {e.msg}"
+        except Exception as e:
+            return False, f"Connection test failed: {str(e)}"
 
+
+# Initialize Twilio client manager
+twilio_manager = TwilioClientManager()
 
 # Simple in-memory subscribers for Server-Sent Events
 subscribers = set()
@@ -55,10 +128,15 @@ def broadcast_event(event_type: str, payload: dict) -> None:
 
 @app.get("/api/health")
 def health() -> Response:
+    # Test connection and get current status
+    is_connected, message = twilio_manager.test_connection()
+    
     return jsonify({
-        "status": "ok",
-        "twilio_configured": bool(twilio_client and TWILIO_NUMBER_A and TWILIO_NUMBER_B),
-        "twilio_auth_method": "api_key" if (TWILIO_API_KEY_SID and TWILIO_API_KEY_SECRET) else "auth_token"
+        "status": "ok" if is_connected else "error",
+        "twilio_configured": bool(twilio_manager.get_client() and TWILIO_NUMBER_A and TWILIO_NUMBER_B),
+        "twilio_auth_method": twilio_manager.get_auth_method(),
+        "twilio_connection_status": message,
+        "twilio_connected": is_connected
     })
 
 
@@ -90,7 +168,13 @@ def sse_events() -> Response:
 
 @app.post("/api/call/connect")
 def create_outbound_call() -> Response:
-    if twilio_client is None:
+    # Test connection before proceeding
+    is_connected, message = twilio_manager.test_connection()
+    if not is_connected:
+        return jsonify({"error": f"Twilio connection failed: {message}"}), 500
+    
+    client = twilio_manager.get_client()
+    if client is None:
         return jsonify({"error": "Twilio is not configured. Check environment variables."}), 400
 
     body = request.get_json(silent=True) or {}
@@ -104,30 +188,65 @@ def create_outbound_call() -> Response:
     if not TWILIO_NUMBER_A:
         return jsonify({"error": "TWILIO_NUMBER_A is not configured"}), 400
 
-    # We'll first call the agent_number, and when they answer, Twilio will hit the
-    # bridge endpoint which dials the customer_number to connect both parties.
-    bridge_params = {"customer": customer_number}
-    bridge_url = f"{BACKEND_URL}/api/voice/bridge?{urlencode(bridge_params)}"
+    # We'll first call the agent_number, and when they answer, Twilio will dial the
+    # customer_number to connect both parties. We provide inline TwiML so Twilio does
+    # not need to fetch our bridge URL.
+    bridge_twiml = (
+        f"<Response>"
+        f"<Dial callerId=\"{TWILIO_NUMBER_A}\">"
+        f"<Number>{customer_number}</Number>"
+        f"</Dial>"
+        f"</Response>"
+    )
 
     try:
-        call = twilio_client.calls.create(
+        call = client.calls.create(
             to=agent_number,
             from_=TWILIO_NUMBER_A,
-            url=bridge_url,
+            twiml=bridge_twiml,
             status_callback=f"{BACKEND_URL}/api/voice/status",
             status_callback_event=["initiated", "ringing", "answered", "completed"],
             status_callback_method="POST",
         )
-        broadcast_event("call_initiated", {"to": agent_number, "customer": customer_number, "sid": call.sid})
-        return jsonify({"sid": call.sid})
+        
+        auth_method = twilio_manager.get_auth_method()
+        broadcast_event("call_initiated", {
+            "to": agent_number, 
+            "customer": customer_number, 
+            "sid": call.sid,
+            "auth_method": auth_method
+        })
+        
+        logger.info(f"Call initiated successfully using {auth_method} authentication")
+        return jsonify({
+            "sid": call.sid,
+            "auth_method": auth_method,
+            "message": "Call initiated successfully"
+        })
+        
+    except TwilioRestException as e:
+        error_msg = f"Twilio error (code {e.code}): {e.msg}"
+        logger.error(error_msg)
+        
+        # If this is an authentication error and we have a fallback, try to switch
+        if e.code == 20003 and twilio_manager.fallback_client and twilio_manager.current_method == "auth_token":
+            logger.info("Attempting to retry with fallback authentication")
+            twilio_manager.current_method = "api_key"
+            # Recursive call to retry with fallback
+            return create_outbound_call()
+        
+        return jsonify({"error": error_msg}), 500
+        
     except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
+        error_msg = f"Unexpected error: {str(exc)}"
+        logger.error(error_msg)
+        return jsonify({"error": error_msg}), 500
 
 
-@app.post("/api/voice/bridge")
+@app.route("/api/voice/bridge", methods=["GET", "POST"])
 def voice_bridge() -> Response:
     """TwiML: once the agent answers, dial out to the customer and bridge."""
-    customer = (request.args.get("customer") or "").strip()
+    customer = (request.values.get("customer") or "").strip()
     vr = VoiceResponse()
     if not customer:
         vr.say("Customer number missing. Goodbye.")
@@ -169,7 +288,6 @@ def inbound_b() -> Response:
     if TWILIO_NUMBER_A:
         dial = Dial(caller_id=TWILIO_NUMBER_B)
         dial.number(TWILIO_NUMBER_A)
-        vr.append(dial)
     else:
         vr.say("No destination configured for this number.")
     return Response(str(vr), mimetype="text/xml")
@@ -186,6 +304,23 @@ def status_callback() -> Response:
     }
     broadcast_event("call_status", payload)
     return ("", 204)
+
+
+@app.get("/api/twilio/status")
+def twilio_status() -> Response:
+    """Get detailed Twilio connection status"""
+    is_connected, message = twilio_manager.test_connection()
+    
+    return jsonify({
+        "connected": is_connected,
+        "message": message,
+        "current_auth_method": twilio_manager.get_auth_method(),
+        "primary_client_available": bool(twilio_manager.primary_client),
+        "fallback_client_available": bool(twilio_manager.fallback_client),
+        "account_sid_configured": bool(TWILIO_ACCOUNT_SID),
+        "api_key_configured": bool(TWILIO_API_KEY_SID and TWILIO_API_KEY_SECRET),
+        "auth_token_configured": bool(TWILIO_AUTH_TOKEN)
+    })
 
 
 def run_app():

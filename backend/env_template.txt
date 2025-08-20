@@ -1,10 +1,22 @@
 # Twilio Configuration
 # You'll need these from your Twilio Console
+
+# Required: Your Twilio Account SID
 TWILIO_ACCOUNT_SID=your_account_sid_here
+
+# Option 1: Auth Token Authentication (Primary - Full Permissions)
+# Get this from your Twilio Console: https://console.twilio.com/us1/account/keys-credentials/auth-tokens
+# Note: This has full account permissions and is more reliable
+TWILIO_AUTH_TOKEN=your_auth_token_here
+
+# Option 2: API Key Authentication (Fallback - More Secure)
+# Create an API Key in your Twilio Console: https://console.twilio.com/us1/account/keys-credentials/api-keys
+# Note: This is more secure but may have permission restrictions
 TWILIO_API_KEY_SID=your_api_key_sid_here
 TWILIO_API_KEY_SECRET=your_api_key_secret_here
 
 # Twilio Phone Numbers
+# These are the phone numbers you've purchased in your Twilio account
 TWILIO_NUMBER_A=+1234567890
 TWILIO_NUMBER_B=+1234567890
 
@@ -13,3 +25,8 @@ FRONTEND_URL=http://localhost:5173
 BACKEND_URL=http://127.0.0.1:5000
 CORS_ORIGIN=http://localhost:5173
 FLASK_SECRET=your-secret-key-here
+
+# Authentication Priority:
+# 1. Auth Token (primary) - has full permissions, more reliable
+# 2. API Key (fallback) - more secure but may have permission restrictions
+# 3. If both fail, the application will not work
